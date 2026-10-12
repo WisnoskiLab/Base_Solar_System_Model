@@ -399,7 +399,7 @@ for (r in 1:n_runs) {  #beginning of main loop
     speed = speed,
     start_x = a_SS * cos(entry_angle),
     start_y = a_SS * sin(entry_angle),
-    has_life = runif(num_SS) < 0.005
+    has_life = runif(num_SS) < 0.05
   )
   SS$size <- runif(num_SS, .1, 10)
   #Dispersal Asteroids from planets
@@ -504,7 +504,7 @@ for (r in 1:n_runs) {  #beginning of main loop
               event_type = "asteroid_hit",
               source = a_name,
               target = p_name,
-              distance_AU = asteroid_row$distance,
+              distance_AU = asteroid_row$distance / AU,
               size = asteroid_row$size,
               had_life = asteroid_row$has_life,
               resulted_in_colonization = colonized_this_hit,
@@ -533,7 +533,7 @@ for (r in 1:n_runs) {  #beginning of main loop
         targets <- targets[planets$habitable[target_indices], ]
         
         if (nrow(targets) > 0) {
-          base_rate <- .10
+          base_rate <- 1 - (1 - 0.20)^(1/timestep)
           scale <- 3*AU
           probs <- base_rate * exp(-targets$dist / scale)
           hits <- runif(nrow(targets)) < probs
@@ -555,7 +555,7 @@ for (r in 1:n_runs) {  #beginning of main loop
               event_type = "dispersal_hit",
               source = og_planet,
               target = tp,
-              distance_AU = dis_to_tp,
+              distance_AU = dis_to_tp / AU,
               size = NA_real_,
               had_life = TRUE,
               resulted_in_colonization = planets$habitable[planet_index[tp]],
