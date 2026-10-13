@@ -566,7 +566,7 @@ for (r in 1:n_runs) {  #beginning of main loop
           if (is.na(idx)) next
           
           # if asteroid has life then it has the chance to seed life on the planet
-          if (a_arrivals$has_life[j] && planets$habitable[idx] && life_status$has_life[idx]) {
+          if (a_arrivals$has_life[j] && planets$habitable[idx] && !life_status$has_life[idx]) {
             life_status$has_life[idx] <- TRUE
             life_history$asteroid_colonized[idx] <- TRUE
             
@@ -587,7 +587,7 @@ for (r in 1:n_runs) {  #beginning of main loop
               notes = "asteroid arrival"
             )
           }
-          if(a_arrivals$has_life[j] && planets$habitable[idx] && life_status$has_life) {
+          if(a_arrivals$has_life[j] && planets$habitable[idx] && !life_status$has_life[idx]) {
             add_event(
               run = r,
               year = year,

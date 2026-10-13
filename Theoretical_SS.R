@@ -595,7 +595,7 @@ for (r in 1:n_runs) {  #beginning of main loop
             notes = "asteroid arrival"
           )
         }
-        if(a_arrivals$has_life[j] && planets$habitable[idx] && life_status$has_life) {
+        if(a_arrivals$has_life[j] && planets$habitable[idx] && !life_status$has_life[idx]) {
           add_event(
             run = r,
             year = year,
