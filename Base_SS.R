@@ -550,8 +550,8 @@ for (r in 1:n_runs) {  #beginning of main loop
                 distance_AU = dis_to_tp / AU,
                 size = NA_real_,
                 had_life = TRUE,
-                resulted_in_colonization = planets$habitable[planet_index[tp]],
-                notes = ""
+                resulted_in_colonization = FALSE,
+                notes = "attempt"
               )
             }
           }
@@ -566,12 +566,13 @@ for (r in 1:n_runs) {  #beginning of main loop
           if (is.na(idx)) next
           
           # if asteroid has life then it has the chance to seed life on the planet
-          if (a_arrivals$has_life[j] && planets$habitable[idx]) {
+          if (a_arrivals$has_life[j] && planets$habitable[idx] && life_status$has_life[idx]) {
             life_status$has_life[idx] <- TRUE
             life_history$asteroid_colonized[idx] <- TRUE
             
             # if life is seeded it is record the first time
-            if (is.na(life_history$first_appearance[idx])) life_history$first_appearance[idx] <- year
+            if (is.na(life_history$first_appearance[idx])) {
+              life_history$first_appearance[idx] <- year}
             
             add_event(
               run = r,
@@ -586,6 +587,20 @@ for (r in 1:n_runs) {  #beginning of main loop
               notes = "asteroid arrival"
             )
           }
+          if(a_arrivals$has_life[j] && planets$habitable[idx] && life_status$has_life) {
+            add_event(
+              run = r,
+              year = year,
+              event_type = "rescue",
+              source = "asteroid",
+              target = tp,
+              distance_AU = NA_real_,
+              size = NA_real_,
+              had_life = TRUE,
+              resulted_in_colonization = FALSE,
+              notes = "rescue event"
+            )
+          }
         }
       }
       pending_asteroid <- pending_asteroid[pending_asteroid$arrival_year != year, ]
@@ -596,7 +611,7 @@ for (r in 1:n_runs) {  #beginning of main loop
         for (j in 1:nrow(d_arrivals)) {
           tp <- d_arrivals$planet[j]
           idx <- planet_index[tp]
-          if (planets$habitable[idx]) { 
+          if (planets$habitable[idx] && !life_status$has_life[idx]) { 
             life_status$has_life[idx] <- TRUE
             life_history$dispersal_colonized[idx] <- TRUE
             
@@ -617,6 +632,20 @@ for (r in 1:n_runs) {  #beginning of main loop
               had_life = TRUE,
               resulted_in_colonization = TRUE,
               notes = "dispersal arrival"
+            )
+          }
+          if(planets$habitable[idx] && life_status$has_life[idx]) {
+            add_event(
+              run = r,
+              year = year,
+              event_type = "rescue",
+              source = d_arrivals$source_planet[j],
+              target = tp,
+              distance_AU = NA_real_,
+              size = NA_real_,
+              had_life = TRUE,
+              resulted_in_colonization = FALSE,
+              notes = "rescue event"
             )
           }
         }
