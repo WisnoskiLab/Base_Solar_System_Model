@@ -179,8 +179,8 @@ planets$can_have_life <- TRUE
 planet_index <- setNames(seq_len(nrow(planets)), planets$name)
 
 #Model Settings
-n_runs <- 1
-n_years <- 1000
+n_runs <- 100
+n_years <- 5000
 timestep <- 100
 
 #timesteps 
@@ -278,7 +278,7 @@ planet_orbits <- data.frame(
 
 planet_orbits$B <- planet_orbits$A * sqrt(1 - planet_orbits$E^2)            #B is the semi minor axis
 planet_orbits$c <- planet_orbits$A * planet_orbits$E   #c is the focal distance
-planet_orbits$collision_radius <- planet_radii * 100
+planet_orbits$collision_radius <- planet_radii * 50
 planet_orbits$capture_radius   <- planet_radii * 1.5
 
 planet_orbits_dt <- as.data.table(planet_orbits)
@@ -450,9 +450,9 @@ for (r in 1:n_runs) {  #beginning of main loop
   #General Asteroid Info
   
   total_asteroids <- sample(10000:100000, 1)
-  frac_IS <- 0.35 #the percent of asteroids that are interstellar asteroids
-  frac_SS <- 0.35 #the percent of asteroids that are already in the solar system (like from our asteroid belt)
-  frac_DI <- 0.30 #the dispersal asteroids that come from the planets
+  frac_IS <- 0.40 #the percent of asteroids that are interstellar asteroids
+  frac_SS <- 0.40 #the percent of asteroids that are already in the solar system (like from our asteroid belt)
+  frac_DI <- 0.20 #the dispersal asteroids that come from the planets
   
   num_IS <- round(total_asteroids * frac_IS)
   num_SS <- round(total_asteroids * frac_SS)
@@ -470,7 +470,7 @@ for (r in 1:n_runs) {  #beginning of main loop
     speed = IS_speed,
     start_x = IS_entry_dist * cos(IS_entry_angle),
     start_y = IS_entry_dist * sin(IS_entry_angle),
-    has_life = runif(num_IS) < 0.005
+    has_life = runif(num_IS) < 0.001
   )
   
   IS$size <- runif(num_IS,.1, 10)
@@ -490,7 +490,7 @@ for (r in 1:n_runs) {  #beginning of main loop
     speed = speed,
     start_x = a_SS * cos(entry_angle),
     start_y = a_SS * sin(entry_angle),
-    has_life = runif(num_SS) < 0.005
+    has_life = runif(num_SS) < 0.001
   )
   SS$size <- runif(num_SS, .1, 10)
   #Dispersal Asteroids from planets
@@ -507,7 +507,7 @@ for (r in 1:n_runs) {  #beginning of main loop
     speed = DI_speed,
     start_x = DI_entry_dist * cos(DI_entry_angle),
     start_y = DI_entry_dist * sin(DI_entry_angle),
-    has_life = FALSE
+    has_life = runif(num_DI) < 0.001
   )
   DI$size <- runif(num_DI, .1, 10)
   
@@ -541,10 +541,11 @@ for (r in 1:n_runs) {  #beginning of main loop
         launch_time   <- asteroids_dt[id == ei, entry_time]
         source_xy     <- planet_xy(source_idx, launch_time)
         launch_offset <- 1.05 * planet_orbits$collision_radius[source_idx]
+        launch_angle <- asteroids_dt[id == ei, entry_angle]
         
         asteroids_dt[id == ei, `:=`(
-          start_x  = source_xy$x + launch_offset * cos(entry_angle),
-          start_y  = source_xy$y + launch_offset * sin(entry_angle),
+          start_x  = source_xy$x + launch_offset * cos(launch_angle),
+          start_y  = source_xy$y + launch_offset * sin(launch_angle),
           has_life = runif(1) < p_carry
         )]
       }
@@ -591,14 +592,14 @@ for (r in 1:n_runs) {  #beginning of main loop
       }
       
       #Collisions detection
-      c <- active[already_hit == FALSE]
-      if (nrow(c) > 0){
+      active_c <- active[already_hit == FALSE]
+      if (nrow(active_c) > 0){
         hits <- rbindlist(lapply(seq_len(nrow(planet_pos_ts)), function(k) {
-          d <- sqrt((c$x_asteroid - planet_pos_ts$x_planet[k])^2 +
-                      (c$y_asteroid - planet_pos_ts$y_planet[k])^2)
+          d <- sqrt((active_c$x_asteroid - planet_pos_ts$x_planet[k])^2 +
+                      (active_c$y_asteroid - planet_pos_ts$y_planet[k])^2)
           idx_hit <- which(d < planet_orbits$collision_radius[k])
           if (length(idx_hit) == 0) return(NULL)
-          out <- c[idx_hit]
+          out <- active_c[idx_hit]
           out[, `:=`(planet = planet_pos_ts$planet[k],
                      distance = d[idx_hit],
                      collision_radius = planet_orbits$collision_radius[k],
