@@ -179,7 +179,7 @@ planets$can_have_life <- TRUE
 planet_index <- setNames(seq_len(nrow(planets)), planets$name)
 
 #Model Settings
-n_runs <- 100
+n_runs <- 30
 n_years <- 5000
 timestep <- 100
 
@@ -236,12 +236,12 @@ results <- data.frame(
   planet_6_colonization_time = numeric(n_runs),
   planet_7_colonization_time = numeric(n_runs),
   
-  planet_2_colonization_events = integer(n_runs),
-  planet_3_colonization_events = integer(n_runs),
-  planet_4_colonization_events = integer(n_runs),
-  planet_5_colonization_events = integer(n_runs),
-  planet_6_colonization_events = integer(n_runs),
-  planet_7_colonization_events = integer(n_runs),
+  planet_2_colonizations = integer(n_runs),
+  planet_3_colonizations = integer(n_runs),
+  planet_4_colonizations = integer(n_runs),
+  planet_5_colonizations = integer(n_runs),
+  planet_6_colonizations = integer(n_runs),
+  planet_7_colonizations = integer(n_runs),
   
   planet_2_persistence = integer(n_runs),
   planet_3_persistence = integer(n_runs),
@@ -268,6 +268,16 @@ solve_kepler <- function(M, e, tol = 1e-10, max_iter = 15) {
   E
 }
 
+closest_approach <-function(ax0, ay0, ax1,ay1, px0, py0, px1, py1) {
+  rx0 <- ax0 - px0;  ry0 <- ay0 - py0       # relative position at start of step
+  rx1 <- ax1 - px1;  ry1 <- ay1 - py1       # relative position at end of step
+  dx  <- rx1 - rx0;  dy  <- ry1 - ry0
+  d2  <- dx^2 + dy^2
+  s   <- ifelse(d2 > 0, -(rx0 * dx + ry0 * dy) / d2, 0)
+  s   <- pmin(pmax(s, 0), 1)                
+  list(dmin = sqrt((rx0 + s * dx)^2 + (ry0 + s * dy)^2), s = s)
+}
+
 #Table of Planets 1 to 100 years and where to find them in this time frame
 planet_orbits <- data.frame(
   name = c("planet_1", "planet_2", "planet_3", "planet_4", "planet_5", "planet_6", "planet_7", "planet_8"),
@@ -278,7 +288,7 @@ planet_orbits <- data.frame(
 
 planet_orbits$B <- planet_orbits$A * sqrt(1 - planet_orbits$E^2)            #B is the semi minor axis
 planet_orbits$c <- planet_orbits$A * planet_orbits$E   #c is the focal distance
-planet_orbits$collision_radius <- planet_radii * 50
+planet_orbits$collision_radius <- planet_radii * 10
 planet_orbits$capture_radius   <- planet_radii * 1.5
 
 planet_orbits_dt <- as.data.table(planet_orbits)
@@ -341,13 +351,36 @@ run_logs <- vector("list", n_runs)
 
 #sets of runs 
 base_ecc <- c(.206, .007,.0167, .09, .048, .056, .047, .0086)
-scenarios <- list(
-  baseline = list (ecc = base_ecc),
-  eccentricity = list(ecc = base_ecc * .5)
+base_A <- c(.5, 1, 3, 5, 7, 9, 11, 13) # semi major distances
+small_A <- c(.5, 1, 2.5, 4, 5.5, 7, 8.5, 10) # semi major axis for system with planets closer together
+big_A <- c(.5, 1, 3.5, 6, 8.5, 11, 13.5, 16) # semi major axis for system with planets farther away
+
+# 3 models
+life_models <- list(
+  planet_only = list(planet2_start = TRUE, planet_dispersal = TRUE, asteroid_life = FALSE),
+  planet_and_asteroids = list(planet2_start = TRUE, planet_dispersal = TRUE, asteroid_life = TRUE),
+  asteroids_only = list(planet2_start = FALSE, planet_dispersal = TRUE, asteroid_life = TRUE)
 )
 
-output_prefix <- "run_output_v4"
+# the 5 solar systems
+systems <- list(
+  base = list(A = base_A, ecc = base_ecc),
+  dist_small = list(A = small_A, ecc = base_ecc),
+  dist_big = list(A = big_A, ecc = base_ecc),
+  ecc_small = list(A = base_A, ecc = base_ecc * .5),
+  ecc_big = list(A = base_A, ecc = base_ecc * 1.5)
+)
+
+scenarios <- list()
+for (lm in names(life_models)) for (sy in names(systems))
+  scenarios[[paste0(lm, "_", sy)]] <- c(systems[[sy]], life_models[[lm]], list(life_model = lm, system = sy))
+
+ejecta_grace_years <- 1
+
+output_prefix <- "run_output_v5"
+base_seed <- 20240601
 paired_seeds <- TRUE
+results$seed <- integer(n_runs)  
 
 results_template <- results
 run_logs <- vector("list", n_runs)
@@ -387,22 +420,38 @@ save_output <- function(scenario_name, run_number = n_runs) {
 for (scenario_name in names(scenarios)) {
   sc <- scenarios[[scenario_name]]
   cat( "\n===Scenario:", scenario_name, "===\n")
+  planet_orbits$A <- sc$A * AU
+  planet_orbits$T <- sc$A^1.5
   planet_orbits$E <- sc$ecc
   planet_orbits$B <- planet_orbits$A * sqrt(1 - planet_orbits$E^2)
   planet_orbits$c <- planet_orbits$A * planet_orbits$E
+  planets$sun_dis <- sc$A
+  planets$establishment_prob <- exp(-.1 * planets$sun_dis)
+  if (any((planet_orbits$A * (1 + planet_orbits$E))[-8] >= (planet_orbits$A * (1 - planet_orbits$E))[-1]))
+    warning("set '", scenario_name, "': some neighbouring orbits cross each other")
+  
   results <- results_template
   run_logs <- vector("list", n_runs)
   event_log <- event_log[0]
   colonization_exposure <- colonization_exposure[0]
   extinction_exposure <- extinction_exposure[0]
 
-for (r in 1:n_runs) {  #beginning of main loop
-  run_start <- Sys.time()
-  
-  planet_orbits$t0 <- runif(8, 0, 2*pi) #new planetary positions every run
+  for (r in 1:n_runs) {
+    run_start <- Sys.time()
+    
+    run_seed <- if (paired_seeds) {
+      base_seed + r                                            # same seed for run r in every scenario
+    } else {
+      base_seed + 1000L * match(scenario_name, names(scenarios)) + r   # unique per scenario × run
+    }
+    set.seed(run_seed)
+    results$seed[r] <- run_seed
+    
+    planet_orbits$t0 <- runif(8, 0, 2*pi)
   
   life_status <- data.frame(planet = planets$name, has_life = FALSE)
-  life_status$has_life[planet_index["planet_2"]] <- TRUE
+  if (sc$planet2_start) life_status$has_life[planet_index["planet_2"]] <- TRUE
+  
   life_history <- data.frame(
     planet = planets$name,
     first_appearance = rep(NA, nrow(planets)),
@@ -412,7 +461,7 @@ for (r in 1:n_runs) {  #beginning of main loop
     dispersal_colonized = rep(FALSE, nrow(planets))
   )
   
-  life_history$first_appearance[planet_index["planet_2"]] <- 0
+  if (sc$planet2_start) life_history$first_appearance[planet_index["planet_2"]] <- 0
   
   persistence <- rep(0, nrow(planets))
   disperse <- rep(FALSE, nrow(planets))
@@ -420,6 +469,9 @@ for (r in 1:n_runs) {  #beginning of main loop
                                   source_planet = character(), launch_AU = numeric())
   pending_asteroid  <- data.frame(planet=character(), arrival_year=numeric(), has_life=logical())
   
+  colonizations <- rep(0L, nrow(planets))
+  system_alive_years <- 0L
+  if(sc$planet2_start) colonizations[planet_index["planet_2"]] <- 1L
   # counters
   planet_3_asteroid_hits <- 0
   planet_4_asteroid_hits <- 0
@@ -439,6 +491,7 @@ for (r in 1:n_runs) {  #beginning of main loop
   ex_prob <- function(size) {1/(1+exp(-(size-3)))}
   local_extinction <- 0.02
   p_carry <- .15
+  p_life_ast <- if (sc$asteroid_life) 0.005 else 0
   planet_xy <- function(planet_idx, at_time) {
     orbit <- planet_orbits[planet_idx, ]
     ma <- (orbit$t0 + at_time * 2 * pi / orbit$T) %% (2 * pi) #mean anomaly
@@ -450,16 +503,18 @@ for (r in 1:n_runs) {  #beginning of main loop
   #General Asteroid Info
   
   total_asteroids <- sample(10000:100000, 1)
-  frac_IS <- 0.40 #the percent of asteroids that are interstellar asteroids
-  frac_SS <- 0.40 #the percent of asteroids that are already in the solar system (like from our asteroid belt)
-  frac_DI <- 0.20 #the dispersal asteroids that come from the planets
+  frac_IS <- 0.50 #the percent of asteroids that are interstellar asteroids
+  frac_SS <- 0.50 #the percent of asteroids that are already in the solar system (like from our asteroid belt)
   
   num_IS <- round(total_asteroids * frac_IS)
   num_SS <- round(total_asteroids * frac_SS)
-  num_DI <- total_asteroids - num_SS - num_IS
+  
+  system_size <- max(sc$A)
+  belt_inner <- .10 * system_size
+  belt_outer <- .30 * system_size
   
   #Interstellar Asteroids
-  IS_entry_dist <- runif(num_IS, 5*AU, 15*AU)
+  IS_entry_dist <- runif(num_IS, .5 * system_size * AU, 1.2 * system_size * AU)
   IS_entry_angle <- runif(num_IS, 0, 2*pi)
   IS_speed <- runif(num_IS, 1.7, 7) * AU
   
@@ -470,13 +525,13 @@ for (r in 1:n_runs) {  #beginning of main loop
     speed = IS_speed,
     start_x = IS_entry_dist * cos(IS_entry_angle),
     start_y = IS_entry_dist * sin(IS_entry_angle),
-    has_life = runif(num_IS) < 0.001
+    has_life = runif(num_IS) < p_life_ast
   )
   
   IS$size <- runif(num_IS,.1, 10)
   IS$travel_angle <- atan2(-IS$start_y, -IS$start_x) + rnorm(num_IS, 0, 0.1)
   #Solar System Asteroids (Asteroid Belt/Random in Solar System Asteroids)
-  a_SS <- runif(num_SS, 1*AU, 3.5*AU) #semi major axis of the asteroids 
+  a_SS <- runif(num_SS, belt_inner * AU, belt_outer * AU) #semi major axis of the asteroids 
   e_SS <- runif(num_SS, 0.1, 0.4) #eccentricity
   entry_angle <- runif(num_SS, 0, 2*pi)
   travel_angle <- entry_angle + pi + rnorm(num_SS, 0, 0.5)
@@ -490,36 +545,20 @@ for (r in 1:n_runs) {  #beginning of main loop
     speed = speed,
     start_x = a_SS * cos(entry_angle),
     start_y = a_SS * sin(entry_angle),
-    has_life = runif(num_SS) < 0.001
+    has_life = runif(num_SS) < p_life_ast
   )
   SS$size <- runif(num_SS, .1, 10)
-  #Dispersal Asteroids from planets
-  DI_entry_dist <- runif(num_DI, .7*AU, 2.0*AU)
-  DI_entry_angle <- runif(num_DI, 0, 2*pi)
-  DI_travel_angle <- DI_entry_angle + rnorm(num_DI, 0, 0.5)
-  DI_speed <- runif(num_DI, .1, 1.5) * AU
   
-  DI <- data.frame(
-    id = paste0("DI_", 1:num_DI),
-    entry_time = runif(num_DI, 0, n_years),
-    entry_angle = DI_entry_angle,
-    travel_angle = DI_travel_angle,
-    speed = DI_speed,
-    start_x = DI_entry_dist * cos(DI_entry_angle),
-    start_y = DI_entry_dist * sin(DI_entry_angle),
-    has_life = runif(num_DI) < 0.001
-  )
-  DI$size <- runif(num_DI, .1, 10)
-  
-  asteroids <- rbind(IS, SS, DI)
+  asteroids <- rbind(IS, SS)
   asteroids$already_hit <- FALSE
   asteroids_dt <- as.data.table(asteroids)
   setkey(asteroids_dt, id)
   
   nt <- n_years * timestep
-  t_grid <- (1:nt) / timestep
+  dt <- 1/ timestep
+  t_grid <- (0:nt) / timestep
   M_all <- sweep(outer(t_grid, 2*pi / planet_orbits$T), 2, planet_orbits$t0, "+") %% (2*pi)
-  E_all <- solve_kepler(M_all, matrix(rep(planet_orbits$E, each = nt), nrow = nt))
+  E_all <- solve_kepler(M_all, matrix(rep(planet_orbits$E, each = nrow(M_all)), nrow = nrow(M_all)))
   X_all <- sweep(sweep(cos(E_all), 2, planet_orbits$A, "*"), 2, planet_orbits$c, "-")
   Y_all <- sweep(sin(E_all), 2, planet_orbits$B, "*")
   
@@ -531,32 +570,17 @@ for (r in 1:n_runs) {  #beginning of main loop
     #life can only be dispersed from planets with life
     sp <- which(life_status$has_life) #seeded planets
     
-    if (length(sp) > 0) { 
-      ejecta <- asteroids_dt[grepl("^DI_", id) &
-                                        entry_time > year - 1 &
-                                        entry_time <= year, id]
-      # ejecta id
-      for (ei in ejecta) {
-        source_idx    <- sp[sample.int(length(sp), 1)]
-        launch_time   <- asteroids_dt[id == ei, entry_time]
-        source_xy     <- planet_xy(source_idx, launch_time)
-        launch_offset <- 1.05 * planet_orbits$collision_radius[source_idx]
-        launch_angle <- asteroids_dt[id == ei, entry_angle]
-        
-        asteroids_dt[id == ei, `:=`(
-          start_x  = source_xy$x + launch_offset * cos(launch_angle),
-          start_y  = source_xy$y + launch_offset * sin(launch_angle),
-          has_life = runif(1) < p_carry
-        )]
-      }
-    }
     
     for(s in 1:timestep) {
-      t <- (year - 1) + s/timestep
-      i_t <- (year - 1) * timestep + s
+      t <- (year - 1) + s * dt
+      i_now <- (year  -1) * timestep + s + 1
+      i_prev <- i_now -1
       planet_pos_ts <- data.frame(planet = planets$name,
-                                  x_planet = X_all[i_t, ],
-                                  y_planet = Y_all[i_t, ])
+                                  x_planet = X_all[i_now, ],
+                                  y_planet = Y_all[i_now, ])
+      px_prev <- X_all[i_prev, ]
+      py_prev <- Y_all[i_prev, ]
+      
       alive_k <- which(life_status$has_life)
        empty_k <- which(
         !life_status$has_life &
@@ -584,30 +608,43 @@ for (r in 1:n_runs) {  #beginning of main loop
       }
       active <- asteroids_dt[entry_time <= t & already_hit == FALSE]
       if(nrow(active) > 0) {
-        e <-t -active$entry_time #elapsed 
-        active[, x_asteroid := start_x + speed * e *cos(travel_angle)]
-        active[, y_asteroid := start_y + speed * e * sin(travel_angle)]
+        e_now <-t -active$entry_time #elapsed 
+        e_prev <- pmax(e_now - dt, 0)
+        active[, `:=`(
+          x_prev     = start_x + speed * e_prev * cos(travel_angle),
+          y_prev     = start_y + speed * e_prev * sin(travel_angle),
+          x_asteroid = start_x + speed * e_now  * cos(travel_angle),
+          y_asteroid = start_y + speed * e_now  * sin(travel_angle)
+        )]
         gone <- active[sqrt(x_asteroid^2 + y_asteroid^2) > 30 * AU, id]
-        if (length(gone) > 0) asteroids_dt[id %in% gone, already_hit := TRUE]
+        if (length(gone) > 0) { 
+          asteroids_dt[id %in% gone, already_hit := TRUE]
+          active <- active[!(id %in% gone)]
+        }
       }
       
       #Collisions detection
-      active_c <- active[already_hit == FALSE]
-      if (nrow(active_c) > 0){
+      if (nrow(active) > 0){
         hits <- rbindlist(lapply(seq_len(nrow(planet_pos_ts)), function(k) {
-          d <- sqrt((active_c$x_asteroid - planet_pos_ts$x_planet[k])^2 +
-                      (active_c$y_asteroid - planet_pos_ts$y_planet[k])^2)
-          idx_hit <- which(d < planet_orbits$collision_radius[k])
+          ca <- closest_approach(
+            active$x_prev, active$y_prev, active$x_asteroid, active$y_asteroid,
+            px_prev[k], py_prev[k], planet_pos_ts$x_planet[k], planet_pos_ts$y_planet[k]
+          )
+          idx_hit <- which(ca$dmin < planet_orbits$collision_radius[k])
           if (length(idx_hit) == 0) return(NULL)
-          out <- active_c[idx_hit]
+          out <- active[idx_hit]
           out[, `:=`(planet = planet_pos_ts$planet[k],
-                     distance = d[idx_hit],
+                     distance = ca$dmin[idx_hit],
+                     t_hit = (t - dt) + ca$s[idx_hit] * dt,
                      collision_radius = planet_orbits$collision_radius[k],
                      capture_radius = planet_orbits$capture_radius[k])]
           out
         }))
         
-        if(nrow(hits) > 0){
+        if(!is.null(hits) && nrow(hits) > 0) {
+          setorder(hits, id, t_hit)
+          hits <- hits[!duplicated(id)]
+          
           for( i in 1:nrow(hits)) {
             p_name <- hits$planet[i]
             a_name <- hits$id[i]
@@ -628,7 +665,7 @@ for (r in 1:n_runs) {  #beginning of main loop
             
             event_log <- rbind(event_log, data.table(
               run = r,
-              year = t,
+              year = asteroid_row$t_hit,
               event_type = "asteroid_hit",
               source = a_name,
               target = p_name,
@@ -708,6 +745,7 @@ for (r in 1:n_runs) {  #beginning of main loop
           if (!life_status$has_life[idx]) {
           life_status$has_life[idx] <- TRUE
           life_history$asteroid_colonized[idx] <- TRUE
+          colonizations[idx] <- colonizations[idx] + 1L
           
           if (is.na(life_history$first_appearance[idx])) life_history$first_appearance[idx] <- year
           
@@ -753,6 +791,7 @@ for (r in 1:n_runs) {  #beginning of main loop
             runif(1) < planets$establishment_prob[idx]) { 
           life_status$has_life[idx] <- TRUE
           life_history$dispersal_colonized[idx] <- TRUE
+          colonizations[idx] <- colonizations[idx] + 1L
           
           if (tp == "planet_2") planet_2_dispersal_hits <- planet_2_dispersal_hits + 1
           if (tp == "planet_3") planet_3_dispersal_hits <- planet_3_dispersal_hits + 1
@@ -800,6 +839,8 @@ for (r in 1:n_runs) {  #beginning of main loop
       if(life_status$has_life[k]) {
         persistence[k] <- persistence[k] + 1
       }
+    }
+    if(any(life_status$has_life)) {system_alive_years <- system_alive_years + 1L
     }
     for(k in seq_len(nrow(planets))){
       
@@ -930,22 +971,6 @@ for (r in 1:n_runs) {  #beginning of main loop
   planet_6_colonization_time <- fa6
   planet_7_colonization_time <- fa7
   
-  # number of colonization events (first appearance + recolonizations)
-  get_colonization_events <- function(pname) {
-    idx <- match(pname, life_history$planet)
-    fa  <- life_history$first_appearance[idx]
-    ev  <- life_history$extinction_events[[idx]]
-    if (is.na(fa)) return(0)
-    1 + length(ev)
-  }
-  
-  planet_2_colonization_events <- get_colonization_events("planet_2")
-  planet_3_colonization_events <- get_colonization_events("planet_3")
-  planet_4_colonization_events <- get_colonization_events("planet_4")
-  planet_5_colonization_events <- get_colonization_events("planet_5")
-  planet_6_colonization_events <- get_colonization_events("planet_6")
-  planet_7_colonization_events <- get_colonization_events("planet_7")
-  
   colonized <- planets$habitable & !is.na(life_history$first_appearance)
   years_possible <- n_years - pmax(life_history$first_appearance, 1) + 1   #years since first colonization
   
@@ -995,12 +1020,12 @@ for (r in 1:n_runs) {  #beginning of main loop
   results$planet_6_colonization_time[r]   <- planet_6_colonization_time
   results$planet_7_colonization_time[r]   <- planet_7_colonization_time
   
-  results$planet_2_colonization_events[r] <- planet_2_colonization_events
-  results$planet_3_colonization_events[r] <- planet_3_colonization_events
-  results$planet_4_colonization_events[r] <- planet_4_colonization_events
-  results$planet_5_colonization_events[r] <- planet_5_colonization_events
-  results$planet_6_colonization_events[r] <- planet_6_colonization_events
-  results$planet_7_colonization_events[r] <- planet_7_colonization_events
+  results$planet_2_colonizations[r] <- colonizations[planet_index["planet_2"]]
+  results$planet_3_colonizations[r] <- colonizations[planet_index["planet_3"]]
+  results$planet_4_colonizations[r] <- colonizations[planet_index["planet_4"]]
+  results$planet_5_colonizations[r] <- colonizations[planet_index["planet_5"]]
+  results$planet_6_colonizations[r] <- colonizations[planet_index["planet_6"]]
+  results$planet_7_colonizations[r] <- colonizations[planet_index["planet_7"]]
   
   results$planet_2_persistence[r] <- persistence[planet_index["planet_2"]]
   results$planet_3_persistence[r] <- persistence[planet_index["planet_3"]]
@@ -1011,6 +1036,7 @@ for (r in 1:n_runs) {  #beginning of main loop
   results$system_mean_persistence[r] <- mean(persistence[planets$habitable])
   results$mean_persistence_frac[r] <- if (any(colonized)) mean(persistence[colonized] / years_possible[colonized]) else NA_real_
   results$system_extinct_at_end[r] <- as.integer(!any(life_status$has_life))
+  results$system_persistence[r] <- system_alive_years
 
 
 run_logs[[r]] <- event_log
@@ -1024,4 +1050,3 @@ if (r %% 5 == 0) {
 }
 save_output(scenario_name, n_runs)
 }
-
