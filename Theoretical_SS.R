@@ -1,4 +1,9 @@
 library(data.table)
+library(foreach)
+library(doParallel)
+
+setDTthreads(1) # each parallel worker uses one thread
+
 AU <- 149597871
 #Planet 8
 #Orbit
@@ -183,6 +188,16 @@ n_runs <- 30
 n_years <- 5000
 timestep <- 100
 
+# number of runs going at once: the cores given by SLURM, or 4 on a laptop
+n_cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = "4"))
+
+# a short version for checking that the script works
+test_run <- FALSE
+if (test_run) {
+  n_runs <- 2
+  n_years <- 20
+}
+
 #timesteps 
 timestep <- 100
 event_table <- data.frame(
@@ -325,31 +340,7 @@ event_log <- data.table(
   notes = character()
 )
 
-add_event <- function(run, year, event_type, source, target,
-                      distance_AU, size, had_life,
-                      resulted_in_colonization, notes) {
-  
-  event_log <<- rbind(
-    event_log,
-    data.table(
-      run = run,
-      year = year,
-      event_type = event_type,
-      source = source,
-      target = target,
-      distance_AU = distance_AU,
-      size = size,
-      had_life = had_life,
-      resulted_in_colonization = resulted_in_colonization,
-      notes = notes
-    ),
-    fill = TRUE
-  )
-}
-
-run_logs <- vector("list", n_runs)
-
-#sets of runs 
+#sets of runs
 base_ecc <- c(.206, .007,.0167, .09, .048, .056, .047, .0086)
 base_A <- c(.5, 1, 3, 5, 7, 9, 11, 13) # semi major distances
 small_A <- c(.5, 1, 2.5, 4, 5.5, 7, 8.5, 10) # semi major axis for system with planets closer together
@@ -380,10 +371,9 @@ ejecta_grace_years <- 1
 output_prefix <- "run_output_v5"
 base_seed <- 20240601
 paired_seeds <- TRUE
-results$seed <- integer(n_runs)  
+results$seed <- integer(n_runs)
 
 results_template <- results
-run_logs <- vector("list", n_runs)
 
 colonization_exposure <- data.table(
   run = integer(),
@@ -400,26 +390,36 @@ extinction_exposure <- data.table(
   distance_from_sun_AU = numeric()
 )
 
-save_output <- function(scenario_name, run_number = n_runs) {
-  ev <- rbindlist(
-    run_logs[seq_len(run_number)],
-    fill = TRUE
-  )
-  saveRDS(
-    list(
-      scenario = scenario_name,
-      settings = scenarios[[scenario_name]],
-      results = results[seq_len(run_number), ],
-      all_events = ev,
-      colonization_exposure = colonization_exposure,
-      extinction_exposure = extinction_exposure
-    ),
-    file = paste0(output_prefix, "_", scenario_name, ".rds"))
-  cat("Saved Scenario:", scenario_name, "| runs completed:", run_number, "\n")
-}
 for (scenario_name in names(scenarios)) {
   sc <- scenarios[[scenario_name]]
-  cat( "\n===Scenario:", scenario_name, "===\n")
+  if (any((sc$A * (1 + sc$ecc))[-8] >= (sc$A * (1 - sc$ecc))[-1]))
+    warning("set '", scenario_name, "': some neighbouring orbits cross each other")
+}
+
+#Design: one row per run of each scenario
+design <- expand.grid(run = 1:n_runs, scenario = names(scenarios),
+                      stringsAsFactors = FALSE)
+design$seed <- if (paired_seeds) {
+  base_seed + design$run                                            # same seed for run r in every scenario
+} else {
+  base_seed + 1000L * match(design$scenario, names(scenarios)) + design$run   # unique per scenario × run
+}
+
+#each finished run is also saved on its own, so runs that finished are kept
+#if the job is stopped early
+dir.create("runs", showWarnings = FALSE)
+
+registerDoParallel(cores = n_cores)
+cat("Running", nrow(design), "runs on", n_cores, "cores\n")
+
+#each run is done separately, and several at once
+run_output <- foreach(i = 1:nrow(design), .errorhandling = "pass") %dopar% {
+  scenario_name <- design$scenario[i]
+  r <- design$run[i]
+  run_seed <- design$seed[i]
+  run_start <- Sys.time()
+
+  sc <- scenarios[[scenario_name]]
   planet_orbits$A <- sc$A * AU
   planet_orbits$T <- sc$A^1.5
   planet_orbits$E <- sc$ecc
@@ -427,26 +427,41 @@ for (scenario_name in names(scenarios)) {
   planet_orbits$c <- planet_orbits$A * planet_orbits$E
   planets$sun_dis <- sc$A
   planets$establishment_prob <- exp(-.1 * planets$sun_dis)
-  if (any((planet_orbits$A * (1 + planet_orbits$E))[-8] >= (planet_orbits$A * (1 - planet_orbits$E))[-1]))
-    warning("set '", scenario_name, "': some neighbouring orbits cross each other")
-  
-  results <- results_template
-  run_logs <- vector("list", n_runs)
-  event_log <- event_log[0]
-  colonization_exposure <- colonization_exposure[0]
-  extinction_exposure <- extinction_exposure[0]
 
-  for (r in 1:n_runs) {
-    run_start <- Sys.time()
-    
-    run_seed <- if (paired_seeds) {
-      base_seed + r                                            # same seed for run r in every scenario
-    } else {
-      base_seed + 1000L * match(scenario_name, names(scenarios)) + r   # unique per scenario × run
-    }
+  #empty tables for this run
+  results <- results_template
+  event_log <- event_log[0]
+
+  #add_event is defined inside the run so that it adds to this run's event log
+  add_event <- function(run, year, event_type, source, target,
+                        distance_AU, size, had_life,
+                        resulted_in_colonization, notes) {
+
+    event_log <<- rbind(
+      event_log,
+      data.table(
+        run = run,
+        year = year,
+        event_type = event_type,
+        source = source,
+        target = target,
+        distance_AU = distance_AU,
+        size = size,
+        had_life = had_life,
+        resulted_in_colonization = resulted_in_colonization,
+        notes = notes
+      ),
+      fill = TRUE
+    )
+  }
+
+  #the exposure tables are built one year at a time and joined at the end of the run
+  colonization_exposure_by_year <- vector("list", n_years)
+  extinction_exposure_by_year <- vector("list", n_years)
+
     set.seed(run_seed)
     results$seed[r] <- run_seed
-    
+
     planet_orbits$t0 <- runif(8, 0, 2*pi)
   
   life_status <- data.frame(planet = planets$name, has_life = FALSE)
@@ -569,8 +584,30 @@ for (scenario_name in names(scenarios)) {
     life_start <- life_status$has_life 
     #life can only be dispersed from planets with life
     sp <- which(life_status$has_life) #seeded planets
-    
-    
+
+    #colonization exposure: a row for every sub-step and every pair of a planet with
+    #life and an empty habitable planet, with their distance at that sub-step.
+    #which planets have life only changes after the sub-steps, so the pairs are
+    #the same for the whole year
+    alive_k <- which(life_status$has_life)
+    empty_k <- which(!life_status$has_life & planets$habitable)
+    if(length(alive_k) > 0 && length(empty_k) > 0){
+      pair_j <- rep(alive_k, each = length(empty_k))
+      pair_k <- rep(empty_k, times = length(alive_k))
+      steps_this_year <- (year - 1) * timestep + (1:timestep) + 1
+      #distances: one row per sub-step, one column per pair
+      sep_AU <- sqrt(
+        (X_all[steps_this_year, pair_j, drop = FALSE] - X_all[steps_this_year, pair_k, drop = FALSE])^2 +
+          (Y_all[steps_this_year, pair_j, drop = FALSE] - Y_all[steps_this_year, pair_k, drop = FALSE])^2) / AU
+      colonization_exposure_by_year[[year]] <- data.table(
+        run = r,
+        year = year,
+        source = rep(planets$name[pair_j], times = timestep),
+        target = rep(planets$name[pair_k], times = timestep),
+        distance_AU = as.vector(t(sep_AU)) #sub-step by sub-step, pairs in order within each
+      )
+    }
+
     for(s in 1:timestep) {
       t <- (year - 1) + s * dt
       i_now <- (year  -1) * timestep + s + 1
@@ -580,33 +617,8 @@ for (scenario_name in names(scenarios)) {
                                   y_planet = Y_all[i_now, ])
       px_prev <- X_all[i_prev, ]
       py_prev <- Y_all[i_prev, ]
-      
-      alive_k <- which(life_status$has_life)
-       empty_k <- which(
-        !life_status$has_life &
-          planets$habitable)
-      
-      if(length(alive_k) > 0 && length(empty_k) > 0){
-        for(j in alive_k){
-          for(k in empty_k){
-            sep_AU <- sqrt(
-              (planet_pos_ts$x_planet[j] - planet_pos_ts$x_planet[k])^2 +
-                (planet_pos_ts$y_planet[j] - planet_pos_ts$y_planet[k])^2) / AU
-            
-            colonization_exposure <- rbind(
-              colonization_exposure,
-              data.table(
-                run = r,
-                year = year,
-                source = planets$name[j],
-                target = planets$name[k],
-                distance_AU = sep_AU
-              )
-            )
-          }
-        }
-      }
-      active <- asteroids_dt[entry_time <= t & already_hit == FALSE]
+
+      active <-asteroids_dt[entry_time <= t & already_hit == FALSE]
       if(nrow(active) > 0) {
         e_now <-t -active$entry_time #elapsed 
         e_prev <- pmax(e_now - dt, 0)
@@ -842,21 +854,16 @@ for (scenario_name in names(scenarios)) {
     }
     if(any(life_status$has_life)) {system_alive_years <- system_alive_years + 1L
     }
-    for(k in seq_len(nrow(planets))){
-      
-      if(life_status$has_life[k]){
-        
-        extinction_exposure <- rbind(
-          extinction_exposure,
-          data.table(
-            run = r,
-            year = year,
-            planet = planets$name[k],
-            distance_from_sun_AU =
-              sqrt(planet_pos_ts$x_planet[k]^2 + planet_pos_ts$y_planet[k]^2) / AU
-          )
-        )
-      }
+    #extinction exposure: each planet with life this year and its distance from the sun
+    alive_now <- which(life_status$has_life)
+    if (length(alive_now) > 0) {
+      extinction_exposure_by_year[[year]] <- data.table(
+        run = r,
+        year = year,
+        planet = planets$name[alive_now],
+        distance_from_sun_AU =
+          sqrt(planet_pos_ts$x_planet[alive_now]^2 + planet_pos_ts$y_planet[alive_now]^2) / AU
+      )
     }
     #extinction on impact
     this_year <- year
@@ -1039,14 +1046,56 @@ for (scenario_name in names(scenarios)) {
   results$system_persistence[r] <- system_alive_years
 
 
-run_logs[[r]] <- event_log
-event_log <- event_log[0]
+  run_minutes <- as.numeric(difftime(Sys.time(), run_start, units = "mins"))
 
-cat("run", r, "of", n_runs, "finished in",
-    round(as.numeric(difftime(Sys.time(), run_start, units = "mins")), 1), "minutes\n")
-if (r %% 5 == 0) {
-    save_output(scenario_name, r)
+  run_result <- list(
+    results = results[r, ],
+    all_events = event_log,
+    colonization_exposure = rbindlist(c(list(colonization_exposure), colonization_exposure_by_year)),
+    extinction_exposure = rbindlist(c(list(extinction_exposure), extinction_exposure_by_year)),
+    minutes = run_minutes
+  )
+  saveRDS(run_result, file.path("runs", paste0(scenario_name, "_run", r, ".rds")))
+
+  cat(scenario_name, "run", r, "of", n_runs, "finished in", round(run_minutes, 1), "minutes\n")
+  run_result
 }
-}
-save_output(scenario_name, n_runs)
+
+#Record which runs finished
+#a run that stopped with an error is flagged in the design table, with its message
+failed <- sapply(run_output, function(x) inherits(x, "error"))
+design$ran <- !failed
+design$error <- ifelse(failed, sapply(run_output, function(x) if (inherits(x, "error")) conditionMessage(x) else ""), "")
+design$minutes <- sapply(run_output, function(x) if (inherits(x, "error")) NA_real_ else x$minutes)
+write.csv(design, "design.csv", row.names = FALSE)
+cat("Runs finished:", sum(design$ran), "of", nrow(design), "\n")
+
+#Save output for each scenario
+for (scenario_name in names(scenarios)) {
+  rows <- which(design$scenario == scenario_name)
+
+  #results: one row per run; a run that failed is a row of NAs with its run number and seed
+  results <- results_template
+  for (i in rows) {
+    r <- design$run[i]
+    if (design$ran[i]) {
+      results[r, ] <- run_output[[i]]$results
+    } else {
+      results[r, setdiff(names(results), "run")] <- NA
+      results$seed[r] <- design$seed[i]
+    }
+  }
+
+  ran_rows <- rows[design$ran[rows]]
+  saveRDS(
+    list(
+      scenario = scenario_name,
+      settings = scenarios[[scenario_name]],
+      results = results,
+      all_events = rbindlist(lapply(run_output[ran_rows], function(x) x$all_events), fill = TRUE),
+      colonization_exposure = rbindlist(c(list(colonization_exposure), lapply(run_output[ran_rows], function(x) x$colonization_exposure))),
+      extinction_exposure = rbindlist(c(list(extinction_exposure), lapply(run_output[ran_rows], function(x) x$extinction_exposure)))
+    ),
+    file = paste0(output_prefix, "_", scenario_name, ".rds"))
+  cat("Saved Scenario:", scenario_name, "| runs completed:", length(ran_rows), "\n")
 }

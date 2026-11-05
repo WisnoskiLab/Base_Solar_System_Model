@@ -1,0 +1,5 @@
+sim_output/
+.Rproj.user/
+.Rhistory
+.DS_Store
+Rplots.pdf
